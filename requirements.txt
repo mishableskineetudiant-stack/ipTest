@@ -1,4 +1,4 @@
 fastapi==0.115.0
 uvicorn==0.30.0
-requests==2.32.0
+requests==2.32.3
 PySocks==1.7.1
