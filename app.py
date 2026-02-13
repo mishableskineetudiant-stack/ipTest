@@ -1,11 +1,12 @@
 """
-Render Worker v2 — Reçoit 1000 proxies, gère tout
-──────────────────────────────────────────────────
-• Reçoit un gros pack de proxies
-• Teste par mini-batch de 10 avec 5 workers
-• Gère le rate limit des APIs de test
-• Renvoie TOUS les résultats d'un coup
-• Background processing pour pas timeout
+Render Worker v3 — FAST
+───────────────────────
+• 20 workers (I/O bound, CPU idle)
+• Timeout 3s (pas 5s)
+• Batch de 50 (pas 10)
+• Pas de pause entre batches
+• Pas de limite de taille
+• Progress en temps réel
 """
 
 import os
@@ -26,26 +27,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("worker")
 
-app = FastAPI(title="Proxy Worker v2", version="2.0.0")
+app = FastAPI(title="Proxy Worker v3", version="3.0.0")
 
-TIMEOUT = 5
-WORKERS = 5
-MINI_BATCH = 10
-MINI_BATCH_PAUSE = 2.0
+TIMEOUT = 3
+WORKERS = 20
+BATCH_SIZE = 50
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# APIs de test avec rotation
 TEST_APIS = [
     {"url": "http://httpbin.org/ip", "key": "origin"},
     {"url": "https://api.ipify.org?format=json", "key": "ip"},
     {"url": "https://ifconfig.me/all.json", "key": "ip_addr"},
 ]
 
-# état des jobs en background
 _jobs = {}
 _jobs_lock = threading.Lock()
-
-# stats globales
 _stats = {
     "total_tested": 0,
     "total_working": 0,
@@ -60,13 +56,11 @@ class BigBatchRequest(BaseModel):
 
 
 class APIRotator:
-    """Tourne entre les APIs, switch sur rate limit."""
-
     def __init__(self):
         self.apis = list(TEST_APIS)
         self.index = 0
         self.lock = threading.Lock()
-        self.fails = {}
+        self._429_count = 0
 
     def get(self):
         with self.lock:
@@ -74,22 +68,25 @@ class APIRotator:
 
     def report_429(self):
         with self.lock:
-            old = self.apis[self.index]["url"]
-            self.index = (self.index + 1) % len(self.apis)
-            new = self.apis[self.index]["url"]
-            if old != new:
-                logger.warning(f"API rotate: {old} → {new}")
+            self._429_count += 1
+            if self._429_count >= 3:
+                old = self.apis[self.index]["url"]
+                self.index = (self.index + 1) % len(self.apis)
+                self._429_count = 0
+                new = self.apis[self.index]["url"]
+                if old != new:
+                    logger.warning(f"API rotate: → {new}")
 
     def reset(self):
         with self.lock:
             self.index = 0
+            self._429_count = 0
 
 
 rotator = APIRotator()
 
 
 def test_one(proxy, protocol, real_ip):
-    """Teste UN proxy."""
     url = f"{protocol}://{proxy}"
     px = {"http": url, "https": url}
     api = rotator.get()
@@ -106,7 +103,7 @@ def test_one(proxy, protocol, real_ip):
             rotator.report_429()
             return None
 
-        if r.status_code != 200 or latency > 4.0:
+        if r.status_code != 200 or latency > 3.5:
             return None
 
         try:
@@ -135,11 +132,7 @@ def test_one(proxy, protocol, real_ip):
         return None
 
 
-def process_big_batch(job_id, proxies, protocol, real_ip):
-    """
-    Traite un gros batch en background.
-    Mini-batch de 10 + pause 2s + rotation API.
-    """
+def process_job(job_id, proxies, protocol, real_ip):
     start = time.time()
     working = []
     tested = 0
@@ -147,45 +140,36 @@ def process_big_batch(job_id, proxies, protocol, real_ip):
 
     rotator.reset()
 
-    logger.info(
-        f"Job {job_id}: START {total} proxies ({protocol})"
-    )
+    logger.info(f"Job {job_id}: {total} proxies ({protocol})")
 
-    for i in range(0, total, MINI_BATCH):
-        batch = proxies[i:i + MINI_BATCH]
+    # tout tester d'un coup avec 20 workers
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=WORKERS
+    ) as ex:
+        futs = {
+            ex.submit(test_one, p, protocol, real_ip): p
+            for p in proxies
+        }
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=WORKERS
-        ) as ex:
-            futs = {
-                ex.submit(test_one, p, protocol, real_ip): p
-                for p in batch
-            }
-            for f in concurrent.futures.as_completed(futs):
-                tested += 1
-                r = f.result()
-                if r:
-                    working.append(r)
+        for f in concurrent.futures.as_completed(futs):
+            tested += 1
+            r = f.result()
+            if r:
+                working.append(r)
 
-        done = min(i + MINI_BATCH, total)
-        if done % 50 == 0 or done == total:
-            logger.info(
-                f"Job {job_id}: [{done}/{total}] "
-                f"✅ {len(working)}"
-            )
+            # update progress toutes les 50
+            if tested % 50 == 0 or tested == total:
+                progress = round(tested / total * 100, 1)
+                with _jobs_lock:
+                    if job_id in _jobs:
+                        _jobs[job_id]["tested"] = tested
+                        _jobs[job_id]["working"] = len(working)
+                        _jobs[job_id]["progress"] = progress
 
-        # update job status
-        with _jobs_lock:
-            if job_id in _jobs:
-                _jobs[job_id]["tested"] = tested
-                _jobs[job_id]["working"] = len(working)
-                _jobs[job_id]["progress"] = round(
-                    done / total * 100, 1
+                logger.info(
+                    f"Job {job_id}: [{tested}/{total}] "
+                    f"✅ {len(working)} ({progress}%)"
                 )
-
-        # pause entre mini-batches
-        if i + MINI_BATCH < total:
-            time.sleep(MINI_BATCH_PAUSE)
 
     duration = round(time.time() - start, 1)
 
@@ -194,12 +178,10 @@ def process_big_batch(job_id, proxies, protocol, real_ip):
         f"✅ {len(working)}/{total} in {duration}s"
     )
 
-    # update stats
     _stats["total_tested"] += tested
     _stats["total_working"] += len(working)
     _stats["total_jobs"] += 1
 
-    # save results
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id]["status"] = "done"
@@ -210,19 +192,19 @@ def process_big_batch(job_id, proxies, protocol, real_ip):
             _jobs[job_id]["progress"] = 100.0
 
 
-# ═══════════════════════════════════════
-# ROUTES
-# ═══════════════════════════════════════
-
 @app.get("/")
 async def root():
+    active = sum(
+        1 for j in _jobs.values() if j["status"] == "running"
+    )
     return {
-        "name": "Proxy Worker v2",
+        "name": "Proxy Worker v3 FAST",
         "stats": _stats,
-        "active_jobs": sum(
-            1 for j in _jobs.values()
-            if j["status"] == "running"
-        ),
+        "active_jobs": active,
+        "config": {
+            "workers": WORKERS,
+            "timeout": TIMEOUT,
+        },
     }
 
 
@@ -237,13 +219,9 @@ async def ping():
 
 
 @app.post("/test")
-async def test_big_batch(req: BigBatchRequest):
-    """
-    Reçoit un gros batch, lance en background.
-    Retourne un job_id pour récupérer les résultats.
-    """
-    if len(req.proxies) > 2000:
-        raise HTTPException(400, "Max 2000 per job")
+async def test_batch(req: BigBatchRequest):
+    if len(req.proxies) > 5000:
+        raise HTTPException(400, "Max 5000")
 
     if not req.proxies:
         return {
@@ -268,9 +246,8 @@ async def test_big_batch(req: BigBatchRequest):
             "started_at": time.time(),
         }
 
-    # lance en background
     thread = threading.Thread(
-        target=process_big_batch,
+        target=process_job,
         args=(job_id, req.proxies, req.protocol, req.real_ip),
         daemon=True,
     )
@@ -286,14 +263,13 @@ async def test_big_batch(req: BigBatchRequest):
 
 @app.get("/job/{job_id}")
 async def get_job(job_id: str):
-    """Récupère le statut/résultats d'un job."""
     with _jobs_lock:
         job = _jobs.get(job_id)
 
     if not job:
-        raise HTTPException(404, "Job not found")
+        raise HTTPException(404, "Not found")
 
-    response = {
+    resp = {
         "job_id": job_id,
         "status": job["status"],
         "total": job["total"],
@@ -304,32 +280,30 @@ async def get_job(job_id: str):
         "protocol": job["protocol"],
     }
 
-    # inclure les résultats seulement quand c'est fini
     if job["status"] == "done":
-        response["results"] = job["results"]
+        resp["results"] = job["results"]
 
-    return response
+    return resp
 
 
 @app.delete("/job/{job_id}")
 async def delete_job(job_id: str):
-    """Supprime un job terminé (libère la mémoire)."""
     with _jobs_lock:
         if job_id in _jobs:
             del _jobs[job_id]
             return {"deleted": True}
-    raise HTTPException(404, "Job not found")
+    raise HTTPException(404, "Not found")
 
 
 @app.get("/jobs")
 async def list_jobs():
-    """Liste tous les jobs."""
     with _jobs_lock:
         return {
             "jobs": {
                 jid: {
                     "status": j["status"],
                     "total": j["total"],
+                    "tested": j["tested"],
                     "working": j["working"],
                     "progress": j["progress"],
                 }
